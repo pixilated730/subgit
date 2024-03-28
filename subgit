@@ -1,0 +1,91 @@
+#!/bin/bash
+
+CONFIG_DIR="$HOME/.subdirconfig"
+SCANNED_PATHS_FILE="$CONFIG_DIR/scanned_paths.json"
+
+check_config() {
+    if [ ! -d "$CONFIG_DIR" ]; then
+        mkdir -p "$CONFIG_DIR"
+    fi
+
+    if [ ! -f "$SCANNED_PATHS_FILE" ]; then
+        touch "$SCANNED_PATHS_FILE"
+    fi
+}
+
+handle_args() {
+    if [ "$1" == "--continue" ] || [ "$1" == "-c" ]; then
+        echo "Continuing from where left off."
+    elif [ "$1" == "--delete" ] || [ "$1" == "-d" ]; then
+        echo "Deleting scanned paths and starting fresh."
+        rm -f "$SCANNED_PATHS_FILE"
+        touch "$SCANNED_PATHS_FILE"
+    else
+     #dont use it in a pipeline the writer is dumb doesnt know what hes going so it will break by pipelin3 i mean echo url.com | waybackurls | subgit  but can be used with echo url.com | subgit -d or -c 
+     #error is on wayback giving blank 
+        echo "Invalid argument. Usage: $0 [--continue|-c | --delete|-d]" 
+        exit 1
+    fi
+}
+
+is_path_scanned() {
+    domain=$1
+    path=$2
+
+    if [ -f "$SCANNED_PATHS_FILE" ]; then
+        if grep -q "\"$domain\"" "$SCANNED_PATHS_FILE"; then
+            if grep -q "\"$path\"" "$SCANNED_PATHS_FILE"; then
+                return 0
+            fi
+        fi
+    fi
+
+    return 1
+}
+
+mark_path_as_scanned() {
+    domain=$1
+    path=$2
+
+    echo "{\"$domain\": { \"path\": \"$path\" }}" >> "$SCANNED_PATHS_FILE"
+}
+
+check_config
+
+if [ $# -eq 1 ]; then
+    handle_args "$1"
+elif [ $# -ne 0 ]; then
+    echo "Invalid number of arguments. Usage: $0 [--continue|-c | --delete|-d]"
+    exit 1
+fi
+
+while read -r url; do
+    #echo "Testing URL: $url" #use for debuging you can uncomment 
+    
+    while [ -n "$url" ]; do
+        #echo "Processing: $url"
+
+        if is_path_scanned "$url"; then
+            #echo "Skipping previously scanned path: $url" #used for debuging 
+            break
+        fi
+
+        git_response=$(curl -s -IsL --max-time 10 "$url/.git/" | grep -i "^HTTP" | awk '{print $2}')
+        config_response=$(curl -s -Is --max-time 10 "$url/.git/config" | grep -i "^HTTP" | awk '{print $2}')
+
+        if [ "$git_response" = "403" ] && [ "$config_response" = "200" ]; then
+            echo "Vulnerable URL found: $url"
+        fi
+
+        mark_path_as_scanned "$url"
+
+        parent_url=$(dirname "$url")
+
+        if [ "$url" = "$parent_url" ]; then
+            break
+        fi
+
+        url="$parent_url"
+    done
+
+done < "${1:-/dev/stdin}"
