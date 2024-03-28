@@ -5,8 +5,14 @@ Subgit is a bash script for scanning vulnerable .git directories recursively wit
 ## How to Run
 
 1. **Prerequisites**: Ensure you have `curl` installed on your system.
+
+2. **clone the script**:
+   ```
+   git clone https://github.com/kevzy/subgit.git
    
-2. **Usage**:
+   ```
+   
+4. **Usage**:
    
    - To run the script with a list of URLs from a file:
      ```
@@ -27,7 +33,13 @@ Subgit is a bash script for scanning vulnerable .git directories recursively wit
 
 1. **Prerequisites**: Ensure you have `curl` installed on your system.
 
-2. **Permission and Installation**:
+2. **clone the script**:
+   ```
+   git clone https://github.com/kevzy/subgit.git
+   
+   ```
+
+3. **Permission and Installation**:
    
    - Make the script executable:
      ```
@@ -39,7 +51,7 @@ Subgit is a bash script for scanning vulnerable .git directories recursively wit
      sudo mv subgit /usr/local/bin
      ```
 
-3. **Usage**:
+4. **Usage**:
    
    - To run the script with a list of URLs from a file:
      ```
