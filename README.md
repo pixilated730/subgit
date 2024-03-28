@@ -15,13 +15,47 @@ Subgit is a bash script for scanning vulnerable .git directories recursively wit
 
    - To run the script with hakrawler:
      ```
-     hakrawler -url https://example.com -depth 2 -plain | ./subgit
+     echo "https://example.com" | hakrawler -d 2 | ./subgit
      ```
 
    - To run the script with waybackurls:
      ```
      echo "https://example.com" | waybackurls | ./subgit
      ```
+
+## OR 
+
+1. **Prerequisites**: Ensure you have `curl` installed on your system.
+
+2. **Permission and Installation**:
+   
+   - Make the script executable:
+     ```
+     chmod +x subgit
+     ```
+
+   - Move the script to the bin directory (optional, for global usage):
+     ```
+     sudo mv subgit /usr/local/bin
+     ```
+
+3. **Usage**:
+   
+   - To run the script with a list of URLs from a file:
+     ```
+     cat urls.txt | subgit
+     ```
+
+   - To run the script with hakrawler:
+     ```
+     echo "https://example.com" | hakrawler -d 2 | subgit
+     ```
+
+   - To run the script with waybackurls:
+     ```
+     echo "https://example.com" | waybackurls | subgit
+     ```
+
 
 3. **Options**:
 
