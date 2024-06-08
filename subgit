@@ -3,89 +3,164 @@
 CONFIG_DIR="$HOME/.subdirconfig"
 SCANNED_PATHS_FILE="$CONFIG_DIR/scanned_paths.json"
 
+# Function to check and set up the configuration directory and file
 check_config() {
     if [ ! -d "$CONFIG_DIR" ]; then
         mkdir -p "$CONFIG_DIR"
     fi
 
     if [ ! -f "$SCANNED_PATHS_FILE" ]; then
-        touch "$SCANNED_PATHS_FILE"
+        echo '{"scanned":[],"vulnerable":[]}' > "$SCANNED_PATHS_FILE"
     fi
 }
 
+# Function to verify the structure of the JSON file
+verify_json_structure() {
+    if ! jq -e '.scanned' "$SCANNED_PATHS_FILE" > /dev/null 2>&1 || ! jq -e '.vulnerable' "$SCANNED_PATHS_FILE" > /dev/null 2>&1; then
+        echo "Invalid JSON structure. Resetting the scanned paths file."
+        echo '{"scanned":[],"vulnerable":[]}' > "$SCANNED_PATHS_FILE"
+    fi
+}
+
+# Function to handle command line arguments
 handle_args() {
     if [ "$1" == "--continue" ] || [ "$1" == "-c" ]; then
         echo "Continuing from where left off."
     elif [ "$1" == "--delete" ] || [ "$1" == "-d" ]; then
         echo "Deleting scanned paths and starting fresh."
         rm -f "$SCANNED_PATHS_FILE"
-        touch "$SCANNED_PATHS_FILE"
+        echo '{"scanned":[],"vulnerable":[]}' > "$SCANNED_PATHS_FILE"
+        exit 0
     else
-     #dont use it in a pipeline the writer is dumb doesnt know what hes going so it will break by pipelin3 i mean echo url.com | waybackurls | subgit  but can be used with echo url.com | subgit -d or -c 
-     #error is on wayback giving blank 
-        echo "Invalid argument. Usage: $0 [--continue|-c | --delete|-d]" 
+        echo "Invalid argument. Usage: $0 [--continue|-c | --delete|-d]"
         exit 1
     fi
 }
 
+# Function to check if a domain and path have already been scanned
 is_path_scanned() {
     domain=$1
     path=$2
-
-    if [ -f "$SCANNED_PATHS_FILE" ]; then
-        if grep -q "\"$domain\"" "$SCANNED_PATHS_FILE"; then
-            if grep -q "\"$path\"" "$SCANNED_PATHS_FILE"; then
-                return 0
-            fi
-        fi
-    fi
-
-    return 1
+    jq -e ".scanned[] | select(.domain == \"$domain\" and .path == \"$path\")" "$SCANNED_PATHS_FILE" > /dev/null 2>&1
 }
 
+# Function to check if a domain and path are vulnerable
+is_path_vulnerable() {
+    domain=$1
+    path=$2
+    jq -e ".vulnerable[] | select(.domain == \"$domain\" and .path == \"$path\")" "$SCANNED_PATHS_FILE" > /dev/null 2>&1
+}
+
+# Function to mark a path as scanned
 mark_path_as_scanned() {
     domain=$1
     path=$2
-
-    echo "{\"$domain\": { \"path\": \"$path\" }}" >> "$SCANNED_PATHS_FILE"
+    jq ".scanned += [{\"domain\": \"$domain\", \"path\": \"$path\"}]" "$SCANNED_PATHS_FILE" > "$CONFIG_DIR/tmp.$$.json" && mv "$CONFIG_DIR/tmp.$$.json" "$SCANNED_PATHS_FILE"
 }
 
+# Function to mark a path as vulnerable
+mark_path_as_vulnerable() {
+    domain=$1
+    path=$2
+    jq ".vulnerable += [{\"domain\": \"$domain\", \"path\": \"$path\"}]" "$SCANNED_PATHS_FILE" > "$CONFIG_DIR/tmp.$$.json" && mv "$CONFIG_DIR/tmp.$$.json" "$SCANNED_PATHS_FILE"
+}
+
+# Check and set up configuration
 check_config
 
+# Verify the JSON structure
+verify_json_structure
+
+# Handle script arguments
 if [ $# -eq 1 ]; then
     handle_args "$1"
+    shift
 elif [ $# -ne 0 ]; then
     echo "Invalid number of arguments. Usage: $0 [--continue|-c | --delete|-d]"
     exit 1
 fi
 
-while read -r url; do
-    #echo "Testing URL: $url" #use for debuging you can uncomment 
-    
-    while [ -n "$url" ]; do
-        #echo "Processing: $url"
+# Function to check if the content is a valid git config file
+is_valid_git_config() {
+    content=$1
+    if echo "$content" | grep -q '\[remote "origin"\]'; then
+        return 0
+    else
+        return 1
+    fi
+}
 
-        if is_path_scanned "$url"; then
-            #echo "Skipping previously scanned path: $url" #used for debuging 
-            break
+# Function to fetch the config file content
+fetch_config_content() {
+    url=$1
+    content=$(curl -s --max-time 10 "$url")
+    echo "$content"
+}
+
+# Function to check both HTTP and HTTPS URLs
+check_url() {
+    domain=$1
+    path=$2
+
+    for scheme in https http; do
+        config_url="$scheme://$domain$path/.git/config"
+        config_content=$(fetch_config_content "$config_url")
+
+        if is_valid_git_config "$config_content"; then
+            echo "Vulnerable URL found: $config_url"
+            mark_path_as_vulnerable "$domain" "$path"
+            return 0
         fi
-
-        git_response=$(curl -s -IsL --max-time 10 "$url/.git/" | grep -i "^HTTP" | awk '{print $2}')
-        config_response=$(curl -s -Is --max-time 10 "$url/.git/config" | grep -i "^HTTP" | awk '{print $2}')
-
-        if [ "$git_response" = "403" ] && [ "$config_response" = "200" ]; then
-            echo "Vulnerable URL found: $url"
-        fi
-
-        mark_path_as_scanned "$url"
-
-        parent_url=$(dirname "$url")
-
-        if [ "$url" = "$parent_url" ]; then
-            break
-        fi
-
-        url="$parent_url"
     done
+
+    return 1
+}
+
+# Read URLs from input
+while read -r url; do
+    # Skip empty lines
+    if [ -z "$url" ]; then
+        continue
+    fi
+
+    if [[ ! "$url" =~ ^http ]]; then
+        url="http://$url"
+    fi
+    
+    domain=$(echo "$url" | awk -F/ '{print $3}')
+    path=$(echo "$url" | awk -F/ '{for (i=4; i<=NF; i++) printf "/" $i; print ""}')
+    
+    # Ensure path is not empty
+    if [ -z "$path" ]; then
+        path="/"
+    fi
+
+    # Traverse up the path
+    while true; do
+        if is_path_scanned "$domain" "$path"; then
+            if is_path_vulnerable "$domain" "$path"; then
+                echo "Vulnerable URL found: http://$domain$path/.git/config"
+            fi
+            break
+        fi
+
+        if check_url "$domain" "$path"; then
+            break
+        fi
+
+        mark_path_as_scanned "$domain" "$path"
+
+        parent_path=$(dirname "$path")
+        if [ "$parent_path" == "." ] || [ "$parent_path" == "/" ] || [ "$parent_path" == "$path" ]; then
+            break
+        fi
+        path="$parent_path/"
+    done
+
+    # Check the root domain path
+    if ! is_path_scanned "$domain" "/"; then
+        check_url "$domain" "/"
+        mark_path_as_scanned "$domain" "/"
+    fi
 
 done < "${1:-/dev/stdin}"

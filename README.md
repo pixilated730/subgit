@@ -19,6 +19,12 @@ Subgit is a bash script for scanning vulnerable .git directories recursively wit
      cat urls.txt | ./subgit
      ```
 
+     Or
+
+     ```
+     ./subgit < urls.txt
+     ```
+
    - To run the script with hakrawler:
      ```
      echo "https://example.com" | hakrawler -d 2 | ./subgit
