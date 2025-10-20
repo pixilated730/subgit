@@ -1,166 +1,238 @@
 #!/bin/bash
+# ~/.local/bin/subdir-scanner.sh
 
 CONFIG_DIR="$HOME/.subdirconfig"
 SCANNED_PATHS_FILE="$CONFIG_DIR/scanned_paths.json"
+TEMP_RESULTS="/tmp/subdir_scan_$$"
+TEMP_INPUT="/tmp/subdir_input_$$"
+MAX_CONCURRENT=10
+CURL_TIMEOUT=5
 
-# Function to check and set up the configuration directory and file
 check_config() {
-    if [ ! -d "$CONFIG_DIR" ]; then
-        mkdir -p "$CONFIG_DIR"
-    fi
-
-    if [ ! -f "$SCANNED_PATHS_FILE" ]; then
-        echo '{"scanned":[],"vulnerable":[]}' > "$SCANNED_PATHS_FILE"
-    fi
+    mkdir -p "$CONFIG_DIR"
+    [ ! -f "$SCANNED_PATHS_FILE" ] && echo '{"scanned":{},"vulnerable":{}}' > "$SCANNED_PATHS_FILE"
 }
 
-# Function to verify the structure of the JSON file
 verify_json_structure() {
-    if ! jq -e '.scanned' "$SCANNED_PATHS_FILE" > /dev/null 2>&1 || ! jq -e '.vulnerable' "$SCANNED_PATHS_FILE" > /dev/null 2>&1; then
-        echo "Invalid JSON structure. Resetting the scanned paths file."
-        echo '{"scanned":[],"vulnerable":[]}' > "$SCANNED_PATHS_FILE"
+    if ! jq -e '.scanned' "$SCANNED_PATHS_FILE" >/dev/null 2>&1; then
+        echo '{"scanned":{},"vulnerable":{}}' > "$SCANNED_PATHS_FILE"
     fi
 }
 
-# Function to handle command line arguments
 handle_args() {
-    if [ "$1" == "--continue" ] || [ "$1" == "-c" ]; then
-        echo "Continuing from where left off."
-    elif [ "$1" == "--delete" ] || [ "$1" == "-d" ]; then
-        echo "Deleting scanned paths and starting fresh."
-        rm -f "$SCANNED_PATHS_FILE"
-        echo '{"scanned":[],"vulnerable":[]}' > "$SCANNED_PATHS_FILE"
-        exit 0
-    else
-        echo "Invalid argument. Usage: $0 [--continue|-c | --delete|-d]"
-        exit 1
+    case "${1:-}" in
+        --continue|-c) return 0 ;;
+        --delete|-d)
+            rm -f "$SCANNED_PATHS_FILE"
+            echo '{"scanned":{},"vulnerable":{}}' > "$SCANNED_PATHS_FILE"
+            exit 0
+            ;;
+        --help|-h)
+            echo "Usage: $0 [--continue|-c | --delete|-d]"
+            exit 0
+            ;;
+        "") return 0 ;;
+        *)
+            echo "Invalid argument: $1"
+            exit 1
+            ;;
+    esac
+}
+
+is_cached() {
+    local key="$1"
+    grep -qxF "$key" "$TEMP_RESULTS.cache" 2>/dev/null
+}
+
+is_vulnerable_cached() {
+    local key="$1"
+    grep -qxF "$key" "$TEMP_RESULTS.vulnerable" 2>/dev/null
+}
+
+check_git_config() {
+    local domain="$1"
+    local path="$2"
+    local key="${domain}:${path}"
+    
+    if is_cached "$key"; then
+        is_vulnerable_cached "$key" && echo "$key" >> "$TEMP_RESULTS.newvuln"
+        return 0
     fi
+    
+    local base_url="${domain}${path}/.git/config"
+    local found=0
+    
+    for scheme in https http; do
+        local url="${scheme}://${base_url}"
+        local response=$(curl -s -m "$CURL_TIMEOUT" -L "$url" 2>/dev/null || echo "")
+        
+        if echo "$response" | grep -q '\[remote "origin"\]'; then
+            echo "$key" >> "$TEMP_RESULTS.vulnerable"
+            echo "$key" >> "$TEMP_RESULTS.newvuln"
+            found=1
+            break
+        fi
+    done
+    
+    echo "$key" >> "$TEMP_RESULTS.cache"
+    return $found
 }
 
-# Function to check if a domain and path have already been scanned
-is_path_scanned() {
-    domain=$1
-    path=$2
-    jq -e ".scanned[] | select(.domain == \"$domain\" and .path == \"$path\")" "$SCANNED_PATHS_FILE" > /dev/null 2>&1
+normalize_path() {
+    local path="$1"
+    path="${path%/}"
+    [ -z "$path" ] && echo "/" || echo "$path"
 }
 
-# Function to check if a domain and path are vulnerable
-is_path_vulnerable() {
-    domain=$1
-    path=$2
-    jq -e ".vulnerable[] | select(.domain == \"$domain\" and .path == \"$path\")" "$SCANNED_PATHS_FILE" > /dev/null 2>&1
+process_url() {
+    local url="$1"
+    
+    [[ ! "$url" =~ ^https?:// ]] && url="http://$url"
+    
+    local domain=$(echo "$url" | awk -F/ '{print $3}')
+    local path=$(echo "$url" | awk -F/ '{for (i=4; i<=NF; i++) printf "/" $i}')
+    
+    [ -z "$path" ] && path="/"
+    path=$(normalize_path "$path")
+    
+    local checked_paths=()
+    
+    while true; do
+        local key="${domain}:${path}"
+        
+        if is_cached "$key"; then
+            is_vulnerable_cached "$key" && echo "$key" >> "$TEMP_RESULTS.newvuln"
+            break
+        fi
+        
+        for checked in "${checked_paths[@]:-}"; do
+            [ "$checked" = "$path" ] && break 2
+        done
+        checked_paths+=("$path")
+        
+        check_git_config "$domain" "$path" &
+        
+        while [ $(jobs -r | wc -l) -ge "$MAX_CONCURRENT" ]; do
+            sleep 0.1
+        done
+        
+        [ "$path" = "/" ] && break
+        
+        local parent=$(dirname "$path")
+        [ "$parent" = "." ] || [ "$parent" = "/" ] && parent="/"
+        [ "$parent" = "$path" ] && break
+        path="$parent"
+    done
 }
 
-# Function to mark a path as scanned
-mark_path_as_scanned() {
-    domain=$1
-    path=$2
-    jq ".scanned += [{\"domain\": \"$domain\", \"path\": \"$path\"}]" "$SCANNED_PATHS_FILE" > "$CONFIG_DIR/tmp.$$.json" && mv "$CONFIG_DIR/tmp.$$.json" "$SCANNED_PATHS_FILE"
+save_results() {
+    local scanned_obj=""
+    local vuln_obj=""
+    
+    if [ -f "$TEMP_RESULTS.cache" ]; then
+        scanned_obj=$(sort -u "$TEMP_RESULTS.cache" | awk -F: '{printf "\"%s:%s\":true,", $1, $2}' | sed 's/,$//')
+    fi
+    
+    if [ -f "$TEMP_RESULTS.vulnerable" ]; then
+        vuln_obj=$(sort -u "$TEMP_RESULTS.vulnerable" | awk -F: '{printf "\"%s:%s\":true,", $1, $2}' | sed 's/,$//')
+    fi
+    
+    cat > "$SCANNED_PATHS_FILE" <<EOF
+{
+  "scanned": {${scanned_obj}},
+  "vulnerable": {${vuln_obj}}
+}
+EOF
 }
 
-# Function to mark a path as vulnerable
-mark_path_as_vulnerable() {
-    domain=$1
-    path=$2
-    jq ".vulnerable += [{\"domain\": \"$domain\", \"path\": \"$path\"}]" "$SCANNED_PATHS_FILE" > "$CONFIG_DIR/tmp.$$.json" && mv "$CONFIG_DIR/tmp.$$.json" "$SCANNED_PATHS_FILE"
+cleanup() {
+    echo "" >&2
+    echo "Shutting down gracefully..." >&2
+    
+    jobs -p | xargs -r kill -9 2>/dev/null
+    wait 2>/dev/null
+    
+    echo "Saving results..." >&2
+    save_results
+    
+    rm -f "$TEMP_RESULTS".* "$TEMP_INPUT" 2>/dev/null
+    
+    echo "Cleanup complete." >&2
 }
 
-# Check and set up configuration
+trap cleanup EXIT INT TERM
+
 check_config
-
-# Verify the JSON structure
 verify_json_structure
+[ $# -gt 0 ] && handle_args "$1"
 
-# Handle script arguments
-if [ $# -eq 1 ]; then
-    handle_args "$1"
-    shift
-elif [ $# -ne 0 ]; then
-    echo "Invalid number of arguments. Usage: $0 [--continue|-c | --delete|-d]"
-    exit 1
+touch "$TEMP_RESULTS.cache"
+touch "$TEMP_RESULTS.vulnerable"
+touch "$TEMP_RESULTS.newvuln"
+
+jq -r '.scanned | keys[]' "$SCANNED_PATHS_FILE" 2>/dev/null >> "$TEMP_RESULTS.cache" || true
+jq -r '.vulnerable | keys[]' "$SCANNED_PATHS_FILE" 2>/dev/null >> "$TEMP_RESULTS.vulnerable" || true
+
+cat > "$TEMP_INPUT"
+
+total_urls=$(wc -l < "$TEMP_INPUT")
+
+if [ "$total_urls" -eq 0 ]; then
+    echo "No URLs to process. Exiting." >&2
+    exit 0
 fi
 
-# Function to check if the content is a valid git config file
-is_valid_git_config() {
-    content=$1
-    if echo "$content" | grep -q '\[remote "origin"\]'; then
-        return 0
-    else
-        return 1
-    fi
-}
+echo "Total URLs to process: $total_urls"
+echo ""
 
-# Function to fetch the config file content
-fetch_config_content() {
-    url=$1
-    content=$(curl -s --max-time 10 "$url")
-    echo "$content"
-}
+url_count=0
+last_update=0
 
-# Function to check both HTTP and HTTPS URLs
-check_url() {
-    domain=$1
-    path=$2
-
-    for scheme in https http; do
-        config_url="$scheme://$domain$path/.git/config"
-        config_content=$(fetch_config_content "$config_url")
-
-        if is_valid_git_config "$config_content"; then
-            echo "Vulnerable URL found: $config_url"
-            mark_path_as_vulnerable "$domain" "$path"
-            return 0
-        fi
-    done
-
-    return 1
-}
-
-# Read URLs from input
-while read -r url; do
-    # Skip empty lines
-    if [ -z "$url" ]; then
-        continue
-    fi
-
-    if [[ ! "$url" =~ ^http ]]; then
-        url="http://$url"
+while IFS= read -r url; do
+    [ -z "$url" ] && continue
+    [[ "$url" =~ ^[[:space:]]*# ]] && continue
+    
+    url_count=$((url_count + 1))
+    
+    update_interval=10
+    [ "$total_urls" -lt 100 ] && update_interval=1
+    [ "$total_urls" -ge 1000 ] && update_interval=50
+    
+    if [ $((url_count - last_update)) -ge $update_interval ] || [ $url_count -eq 1 ] || [ $url_count -eq $total_urls ]; then
+        vuln_count=$([ -f "$TEMP_RESULTS.vulnerable" ] && sort -u "$TEMP_RESULTS.vulnerable" | wc -l || echo 0)
+        scan_count=$([ -f "$TEMP_RESULTS.cache" ] && wc -l < "$TEMP_RESULTS.cache" || echo 0)
+        remaining=$((total_urls - url_count))
+        percent=$((url_count * 100 / total_urls))
+        active_jobs=$(jobs -r | wc -l)
+        
+        printf "\r\033[K[%3d%%] URLs: %d/%d | Paths: %d | Vulnerable: %d | Active: %d | Remaining: %d" \
+            "$percent" "$url_count" "$total_urls" "$scan_count" "$vuln_count" "$active_jobs" "$remaining" >&2
+        
+        last_update=$url_count
     fi
     
-    domain=$(echo "$url" | awk -F/ '{print $3}')
-    path=$(echo "$url" | awk -F/ '{for (i=4; i<=NF; i++) printf "/" $i; print ""}')
-    
-    # Ensure path is not empty
-    if [ -z "$path" ]; then
-        path="/"
-    fi
+    process_url "$url"
+done < "$TEMP_INPUT"
 
-    # Traverse up the path
-    while true; do
-        if is_path_scanned "$domain" "$path"; then
-            if is_path_vulnerable "$domain" "$path"; then
-                echo "Vulnerable URL found: http://$domain$path/.git/config"
-            fi
-            break
-        fi
+wait
 
-        if check_url "$domain" "$path"; then
-            break
-        fi
+echo "" >&2
+echo "" >&2
 
-        mark_path_as_scanned "$domain" "$path"
+vuln_count=$([ -f "$TEMP_RESULTS.vulnerable" ] && sort -u "$TEMP_RESULTS.vulnerable" | wc -l || echo 0)
+scan_count=$([ -f "$TEMP_RESULTS.cache" ] && sort -u "$TEMP_RESULTS.cache" | wc -l || echo 0)
+new_vuln_count=$([ -f "$TEMP_RESULTS.newvuln" ] && sort -u "$TEMP_RESULTS.newvuln" | wc -l || echo 0)
 
-        parent_path=$(dirname "$path")
-        if [ "$parent_path" == "." ] || [ "$parent_path" == "/" ] || [ "$parent_path" == "$path" ]; then
-            break
-        fi
-        path="$parent_path/"
+echo "===== SCAN COMPLETE ====="
+echo "URLs processed: $url_count"
+echo "Total paths scanned: $scan_count"
+echo "Total vulnerable: $vuln_count"
+echo "New vulnerable found: $new_vuln_count"
+
+if [ "$new_vuln_count" -gt 0 ]; then
+    echo ""
+    echo "Newly Found Vulnerable URLs:"
+    sort -u "$TEMP_RESULTS.newvuln" | while IFS=: read domain path; do
+        echo "  http://$domain$path/.git/config"
     done
-
-    # Check the root domain path
-    if ! is_path_scanned "$domain" "/"; then
-        check_url "$domain" "/"
-        mark_path_as_scanned "$domain" "/"
-    fi
-
-done < "${1:-/dev/stdin}"
+fi
